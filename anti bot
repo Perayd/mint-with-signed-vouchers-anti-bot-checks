@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract AntiBotMint is ERC721Enumerable, Ownable {
+    using ECDSA for bytes32;
+
+    // signer that the server uses to sign vouchers
+    address public voucherSigner;
+
+    // sale controls
+    uint256 public saleStart;               // unix timestamp when minting starts
+    uint256 public maxPerAddress = 2;       // per-wallet mint cap
+    uint256 public maxSupply;
+    uint256 public price = 0.05 ether;
+    uint256 public maxGasPrice = 100 gwei;  // optional gas price cap (helps bots)
+
+    // anti-bot bookkeeping
+    mapping(address => uint256) public mintedPerAddress;
+    mapping(address => uint256) public lastMintBlock; // prevent same-block mints
+
+    // EIP-712 domain data
+    bytes32 public DOMAIN_SEPARATOR;
+    bytes32 public constant VOUCHER_TYPEHASH = keccak256("Voucher(address buyer,uint256 quantity,uint256 nonce)");
+
+    // used nonces so vouchers can't be replayed
+    mapping(address => uint256) public nonces;
+
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        uint256 maxSupply_,
+        address voucherSigner_,
+        uint256 saleStart_
+    ) ERC721(name_, symbol_) {
+        maxSupply = maxSupply_;
+        voucherSigner = voucherSigner_;
+        saleStart = saleStart_;
+
+        uint256 chainId;
+        assembly { chainId := chainid() }
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("AntiBotMint")),
+                keccak256(bytes("1")),
+                chainId,
+                address(this)
+            )
+        );
+    }
+
+    /* ========== MODIFIERS ========== */
+
+    modifier onlyEOA() {
+        // require msg.sender == tx.origin prevents contracts from calling
+        // Note: breaks some smart wallets / relayers; use carefully
+        require(msg.sender == tx.origin, "Only EOA");
+        _;
+    }
+
+    /* ========== VOUCHER ========== */
+    struct Voucher {
+        address buyer;
+        uint256 quantity;
+        uint256 nonce;
+    }
+
+    function _verifyVoucher(Voucher calldata v, bytes calldata signature) internal view returns (bool) {
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR,
+                keccak256(abi.encode(VOUCHER_TYPEHASH, v.buyer, v.quantity, v.nonce))
+            )
+        );
+        address sigOwner = digest.recover(signature);
+        return sigOwner == voucherSigner;
+    }
+
+    /* ========== MINT ========== */
+
+    function mintWithVoucher(uint256 quantity, uint256 nonce, bytes calldata signature) external payable onlyEOA {
+        require(block.timestamp >= saleStart, "Sale hasn't started");
+        require(totalSupply() + quantity <= maxSupply, "Max supply reached");
+        require(msg.value == price * quantity, "Wrong ETH amount");
+        require(tx.gasprice <= maxGasPrice, "Gas price too high"); // heuristic
+        require(lastMintBlock[msg.sender] != block.number, "Only one mint per block");
+        require(mintedPerAddress[msg.sender] + quantity <= maxPerAddress, "Per-wallet limit");
+
+        // verify voucher
+        Voucher memory v = Voucher({buyer: msg.sender, quantity: quantity, nonce: nonce});
+        require(_verifyVoucher(v, signature), "Invalid voucher signature");
+        require(nonces[msg.sender] < nonce+1, "Nonce already used"); // simple replay guard
+        nonces[msg.sender] = nonce + 1;
+
+        // record anti-bot state
+        lastMintBlock[msg.sender] = block.number;
+        mintedPerAddress[msg.sender] += quantity;
+
+        // mint tokens (simple sequential mint)
+        for (uint256 i = 0; i < quantity; i++) {
+            _safeMint(msg.sender, totalSupply() + 1);
+        }
+    }
+
+    /* ========== OWNER ========== */
+
+    function setVoucherSigner(address _signer) external onlyOwner {
+        voucherSigner = _signer;
+    }
+
+    function setSaleStart(uint256 ts) external onlyOwner {
+        saleStart = ts;
+    }
+
+    function setMaxPerAddress(uint256 m) external onlyOwner {
+        maxPerAddress = m;
+    }
+
+    function setMaxGasPrice(uint256 gweiLimit) external onlyOwner {
+        maxGasPrice = gweiLimit * 1 gwei;
+    }
+
+    function withdraw(address payable to) external onlyOwner {
+        to.transfer(address(this).balance);
+    }
+
+    // fallback receive
+    receive() external payable {}
+}
